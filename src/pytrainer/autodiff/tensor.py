@@ -2,13 +2,7 @@ import numpy as np
 
 
 class Tensor:
-    """A minimal Tensor wrapping a NumPy array with autograd metadata.
-
-    Design: each operation returns a NEW Tensor that records its parents
-    (the input tensors) and a local backward function, so gradients are
-    accumulated by traversing the graph in reverse topological order
-    rather than by differentiating the whole expression at once.
-    """
+    """A minimal Tensor wrapping a NumPy array with autograd metadata."""
 
     def __init__(self, data, requires_grad=False, _parents=(), _backward=None):
         if isinstance(data, Tensor):
@@ -48,19 +42,15 @@ class Tensor:
     def item(self):
         return self.data.item()
 
-    def zero_grad(self):
-        self.grad = np.zeros_like(self.data)
+    def __repr__(self):
+        rg = ", requires_grad=True" if self.requires_grad else ""
+        return f"Tensor({np.array2string(self.data, precision=4)}{rg})"
 
     def _ensure_grad(self):
         """Initialize grad storage (zero-valued) if not yet present."""
         if self.grad is None:
             self.grad = np.zeros_like(self.data)
         return self.grad
-
-    def __repr__(self):
-        rg = ", requires_grad=True" if self.requires_grad else ""
-        has_graph = ", graph" if (self._parents or self._backward) else ""
-        return f"Tensor({np.array2string(self.data, precision=4)}{rg}{has_graph})"
 
     def _graph_metadata(self):
         """Inspectable graph metadata for this node."""
@@ -74,85 +64,72 @@ class Tensor:
         }
 
     # ------------------------------------------------------------------
-    # Operations: each builds a new Tensor and captures a local backward rule
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _from_op(data, parents, backward):
-        """Result tensor tracks grads iff any parent does."""
-        requires_grad = any(p.requires_grad for p in parents)
-        return Tensor(data, requires_grad=requires_grad,
-                      _parents=parents, _backward=backward)
-
-    def __add__(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(other)
-        out_data = self.data + other.data
-
-        def backward():
-            g = out.grad
-            if self.requires_grad:
-                self._ensure_grad(); self.grad += Tensor._unbroadcast(g, self.shape)
-            if other.requires_grad:
-                other._ensure_grad(); other.grad += Tensor._unbroadcast(g, other.shape)
-
-        out = Tensor._from_op(out_data, (self, other), backward)
-        return out
-
-    def __mul__(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(other)
-        out_data = self.data * other.data
-
-        def backward():
-            g = out.grad
-            if self.requires_grad:
-                self._ensure_grad(); self.grad += Tensor._unbroadcast(g * other.data, self.shape)
-            if other.requires_grad:
-                other._ensure_grad(); other.grad += Tensor._unbroadcast(g * self.data, other.shape)
-
-        out = Tensor._from_op(out_data, (self, other), backward)
-        return out
-
-
-    def __neg__(self):
-        return self * -1.0
-
-    def __sub__(self, other):
-        other = other if isinstance(other, Tensor) else Tensor(other)
-        return self + (-other)
-
-    def __radd__(self, other):
-        return self + other
-
-    def __rmul__(self, other):
-        return self * other
-
-    
-
-    # ------------------------------------------------------------------
     # Backward pass: reverse topological traversal of the graph
     # ------------------------------------------------------------------
     def backward(self, seed=None):
         if not self.requires_grad:
             raise RuntimeError("called backward on a tensor that does not require grad")
+        
+        # initialize the output gradient
         if seed is None:
+            if self.data.ndim != 0:
+                raise ValueError(
+                    "seed must be provided for non-scalar outputs"
+                )
             seed = np.ones_like(self.data)
-        # self._ensure_grad()[:] += seed
+        else:
+            seed = np.asarray(seed, dtype=np.float64)
+            if seed.shape != self.data.shape:
+                raise ValueError(
+                    f"Expected seed shape {self.data.shape}, "
+                    f"got {seed.shape}"
+                )
+            
         self._ensure_grad()
         self.grad += seed
 
-        topo, visited, stack = [], set(), [(self, False)]
+        topo, state, stack = [], {}, [(self, False)]
         while stack:
-            node, processed = stack.pop()
-            if processed:
+            node, expanded = stack.pop()
+            node_id = id(node)
+
+            if expanded:
+                if state.get(node_id) == 2:
+                    continue
+
+                state[node_id] = 2
                 topo.append(node)
                 continue
-            if id(node) in visited:
+
+            if state.get(node_id) == 2:
                 continue
-            visited.add(id(node))
+
+            if state.get(node_id) == 1:
+                continue
+
+            state[node_id] = 1
             stack.append((node, True))
-            for p in node._parents:
-                if id(p) not in visited:
-                    stack.append((p, False))
+
+            for parent in reversed(node._parents):
+                if state.get(id(parent)) != 2:
+                    stack.append((parent, False))
 
         for node in reversed(topo):
             if node._backward is not None:
                 node._backward()
+
+
+# Attach differentiable operations as dunder methods for syntactic sugar
+from pytrainer.autodiff import ops
+Tensor.__add__ = lambda self, other: ops.add(self, other)
+Tensor.__radd__ = lambda self, other: ops.add(other, self)
+Tensor.__mul__ = lambda self, other: ops.mul(self, other)
+Tensor.__rmul__ = lambda self, other: ops.mul(other, self)
+Tensor.__sub__ = lambda self, other: ops.sub(self, other)
+Tensor.__rsub__ = lambda self, other: ops.sub(other, self)
+Tensor.__truediv__ = lambda self, other: ops.div(self, other)
+Tensor.__rtruediv__ = lambda self, other: ops.div(other, self)
+Tensor.__pow__ = lambda self, other: ops.pow(self, other)
+Tensor.__getitem__ = lambda self, indices: ops.getitem(self, indices)
+Tensor.__matmul__ = lambda self, other: ops.matmul(self, other)
+Tensor.__rmatmul__ = lambda self, other: ops.matmul(other, self)
