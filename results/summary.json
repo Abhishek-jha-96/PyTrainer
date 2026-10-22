@@ -1,0 +1,41 @@
+{
+  "config": {
+    "seed": 42,
+    "max_epochs": 300,
+    "patience": 30,
+    "min_delta": 0.0001,
+    "batch_size": 64,
+    "lr": 0.001,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "eps": 1e-08,
+    "eval_batch_size": 256,
+    "log_every": 10
+  },
+  "epochs_run": 154,
+  "stopped_early": true,
+  "selected_epoch": 124,
+  "baseline": {
+    "train_loss": 0.44614267063881324,
+    "train_accuracy": 0.8121428571428572,
+    "val_loss": 0.489732498285325,
+    "val_accuracy": 0.78
+  },
+  "last_epoch": {
+    "train_loss": 0.0669943322674251,
+    "train_accuracy": 0.9735714285714285,
+    "val_loss": 0.07470927945944959,
+    "val_accuracy": 0.97
+  },
+  "selected": {
+    "train_loss": 0.06875893224906487,
+    "train_accuracy": 0.9735714285714285,
+    "val_loss": 0.07163351179353789,
+    "val_accuracy": 0.97
+  },
+  "test": {
+    "loss": 0.08566884229819875,
+    "accuracy": 0.96,
+    "n": 300
+  }
+}
