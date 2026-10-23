@@ -126,3 +126,43 @@ class Adam:
             f"Adam(lr={self.lr}, beta1={self.beta1}, beta2={self.beta2}, "
             f"eps={self.eps}, params={len(self.parameters)}, t={self.t})"
         )
+
+
+class MaskedAdam(Adam):
+    """Adam that keeps pruned weights exactly at zero.
+ 
+    For a masked-out entry the optimizer:
+      * resets its first and second moments when the mask is set, so no
+        stored momentum can move it later;
+      * zeroes its gradient before every update;
+      * re-applies the mask to the weight after every update.
+ 
+    Unmasked parameters (e.g. biases) behave exactly like plain Adam.
+    """
+ 
+    def __init__(self, parameters, **kwargs):
+        super().__init__(parameters, **kwargs)
+        self._index = {id(p): i for i, p in enumerate(self.parameters)}
+        self.masks = [None] * len(self.parameters)
+ 
+    def set_mask(self, param, mask):
+        i = self._index.get(id(param))
+        if i is None:
+            raise ValueError("parameter is not managed by this optimizer")
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape != param.data.shape:
+            raise ValueError(f"mask shape {mask.shape} != parameter shape {param.data.shape}")
+        self.masks[i] = mask
+        self.m[i][~mask] = 0.0
+        self.v[i][~mask] = 0.0
+        param.data[~mask] = 0.0
+ 
+    def step(self):
+        for p, mask in zip(self.parameters, self.masks):
+            if mask is not None and p.grad is not None:
+                p.grad = np.where(mask, p.grad, 0.0)
+        super().step()
+        for p, mask in zip(self.parameters, self.masks):
+            if mask is not None:
+                p.data[~mask] = 0.0
+ 

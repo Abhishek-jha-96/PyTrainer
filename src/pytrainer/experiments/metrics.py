@@ -53,20 +53,20 @@ def evaluate(model, X, y, batch_size=256):
 HISTORY_FIELDS = ("epoch", "train_loss", "train_accuracy", "val_loss", "val_accuracy")
 
 
-def save_history_csv(history, path):
-    """Write one row per epoch with the HISTORY_FIELDS columns."""
+def save_history_csv(history, path, fields=HISTORY_FIELDS):
+    """Write one row per epoch with the given columns (first column = integer epoch)."""
     import csv
-
-    lengths = {len(history[k]) for k in HISTORY_FIELDS}
+ 
+    lengths = {len(history[k]) for k in fields}
     if len(lengths) != 1:
         raise ValueError(f"history columns have different lengths: {lengths}")
-
+ 
     with open(path, "w", newline="") as fh:
         writer = csv.writer(fh)
-        writer.writerow(HISTORY_FIELDS)
-        for row in zip(*(history[k] for k in HISTORY_FIELDS)):
+        writer.writerow(fields)
+        for row in zip(*(history[k] for k in fields)):
             epoch, *values = row
-            writer.writerow([int(epoch)] + [repr(float(v)) for v in values])
+            writer.writerow([int(epoch)] + [v if isinstance(v, str) else repr(float(v)) for v in values])
 
 
 def load_history_csv(path):
