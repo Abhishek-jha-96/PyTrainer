@@ -42,13 +42,21 @@ INITIALIZERS = {
 
 
 class Linear:
-    """Fully connected layer computing ``Y = X @ W + b``.
+    """Fully connected layer computing ``Y = X @ (W * M) + b``.
 
     Shapes:
-        x:      (N, in_features)
-        weight: (in_features, out_features)   i.e. (fan_in, fan_out)
-        bias:   (out_features,)
-        output: (N, out_features)
+        x:           (N, in_features)
+        weight:      (in_features, out_features)   i.e. (fan_in, fan_out)
+        weight_mask: (in_features, out_features)   binary, non-trainable
+        bias:        (out_features,)
+        output:      (N, out_features)
+
+    The forward pass uses ``W_effective = W * M``. Because ``M`` is a
+    constant (``requires_grad=False``), the engine's ``mul`` backward gives
+    ``dL/dW = M * dL/dW_effective``: masked connections receive zero
+    gradient and have no effect on the output, whatever value the raw
+    weight holds. The mask starts as all ones (dense) and is never
+    returned by ``parameters()``, so the optimizer cannot update it.
 
     Args:
         in_features, out_features: layer dimensions.
@@ -80,6 +88,26 @@ class Linear:
         self.weight = Tensor(weight_data, requires_grad=True)
         self.bias = Tensor(np.zeros(out_features), requires_grad=True)
 
+        # Fixed, non-trainable binary mask (all ones = dense layer).
+        self.weight_mask = Tensor(np.ones_like(self.weight.data), requires_grad=False)
+
+    def set_weight_mask(self, mask):
+        """Replace the mask in place (the mask Tensor keeps its identity)."""
+        mask = np.asarray(mask)
+        if mask.shape != self.weight.data.shape:
+            raise ValueError(
+                f"mask shape {mask.shape} != weight shape {self.weight.data.shape}"
+            )
+        values = mask.astype(np.float64)
+        if not np.all((values == 0.0) | (values == 1.0)):
+            raise ValueError("weight mask must be binary (0/1 or bool)")
+        self.weight_mask.data[...] = values
+
+    @property
+    def active_weights(self):
+        """Number of connections the mask keeps."""
+        return int(np.count_nonzero(self.weight_mask.data))
+
     def __call__(self, x):
         # Wrap raw arrays: Tensor does not opt out of NumPy's operator
         # dispatch, so `ndarray @ Tensor` would bypass the engine.
@@ -92,13 +120,19 @@ class Linear:
                 f"got {x.shape}"
             )
 
-        return ops.add(ops.matmul(x, self.weight), self.bias)
+        if self.weight_mask.requires_grad:
+            raise RuntimeError("weight_mask must not require grad")
+
+        effective_weight = ops.mul(self.weight, self.weight_mask)
+        return ops.add(ops.matmul(x, effective_weight), self.bias)
 
     def parameters(self):
+        # The mask is deliberately excluded: it must never reach the optimizer.
         return [self.weight, self.bias]
 
     def __repr__(self):
         return (
             f"Linear(in_features={self.in_features}, "
-            f"out_features={self.out_features}, init={self.init!r})"
+            f"out_features={self.out_features}, init={self.init!r}, "
+            f"active_weights={self.active_weights}/{self.weight.data.size})"
         )

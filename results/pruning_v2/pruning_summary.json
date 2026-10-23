@@ -1,0 +1,58 @@
+{
+  "config": {
+    "seed": 42,
+    "criterion": "taylor_abs",
+    "final_sparsity": 0.9,
+    "start_epoch": 10,
+    "end_epoch": 80,
+    "finetune_epochs": 20,
+    "prune_every": 1,
+    "ema_decay": 0.9,
+    "min_keep_fraction": 0.05,
+    "min_per_output_unit": 1,
+    "lr": 0.001,
+    "batch_size": 64,
+    "eval_batch_size": 256,
+    "log_every": 10
+  },
+  "total_epochs": 100,
+  "selected_epoch": 100,
+  "budget": {
+    "eligible_weights": 608,
+    "kept": 61,
+    "pruned": 547,
+    "sparsity": 0.899671052631579
+  },
+  "biases_dense": 50,
+  "safeguard_kept_max": 0,
+  "selected": {
+    "target_sparsity": 0.9,
+    "sparsity": 0.899671052631579,
+    "train_loss": 0.08148008559800021,
+    "train_accuracy": 0.9657142857142857,
+    "val_loss": 0.08122479638101315,
+    "val_accuracy": 0.9666666666666667
+  },
+  "test": {
+    "loss": 0.08669858436520628,
+    "accuracy": 0.96,
+    "n": 300
+  },
+  "layers": {
+    "fc1.weight": {
+      "kept": 20,
+      "total": 64,
+      "sparsity": 0.6875
+    },
+    "fc2.weight": {
+      "kept": 30,
+      "total": 512,
+      "sparsity": 0.94140625
+    },
+    "fc3.weight": {
+      "kept": 11,
+      "total": 32,
+      "sparsity": 0.65625
+    }
+  }
+}

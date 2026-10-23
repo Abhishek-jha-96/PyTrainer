@@ -3,69 +3,61 @@
     "seed": 42,
     "criterion": "taylor_abs",
     "final_sparsity": 0.9,
-    "num_prune_events": 15,
-    "prune_every": 2,
-    "finetune_epochs": 40,
+    "start_epoch": 10,
+    "end_epoch": 80,
+    "finetune_epochs": 20,
+    "prune_every": 1,
     "ema_decay": 0.9,
     "min_keep_fraction": 0.05,
     "min_per_output_unit": 1,
     "lr": 0.001,
     "batch_size": 64,
     "eval_batch_size": 256,
-    "log_every": 5
+    "log_every": 10
   },
-  "dense": {
-    "epoch": 124,
-    "val": {
-      "loss": 0.07163351179353789,
-      "accuracy": 0.97,
-      "n": 300
-    },
-    "test": {
-      "loss": 0.08566884229819875,
-      "accuracy": 0.96,
-      "n": 300
-    },
-    "weights": 608
+  "total_epochs": 100,
+  "selected_epoch": 100,
+  "budget": {
+    "eligible_weights": 608,
+    "kept": 61,
+    "pruned": 547,
+    "sparsity": 0.899671052631579
   },
-  "pruned": {
-    "selected_epoch": 69,
+  "biases_dense": 50,
+  "safeguard_kept_max": 0,
+  "selected": {
+    "target_sparsity": 0.9,
     "sparsity": 0.899671052631579,
-    "weights_kept": 61,
-    "val": {
-      "loss": 0.08239317661690446,
-      "accuracy": 0.9666666666666667
+    "train_loss": 0.07851480782596978,
+    "train_accuracy": 0.9685714285714285,
+    "val_loss": 0.0796217810180013,
+    "val_accuracy": 0.96
+  },
+  "test": {
+    "loss": 0.0898940491740398,
+    "accuracy": 0.96,
+    "n": 300
+  },
+  "layers": {
+    "fc1.weight": {
+      "kept": 21,
+      "total": 64,
+      "sparsity": 0.671875,
+      "units_without_inputs": 17,
+      "units_without_outputs": 15
     },
-    "train": {
-      "loss": 0.08137201130761457,
-      "accuracy": 0.9692857142857143
+    "fc2.weight": {
+      "kept": 29,
+      "total": 512,
+      "sparsity": 0.943359375,
+      "units_without_inputs": 9,
+      "units_without_outputs": 10
     },
-    "test": {
-      "loss": 0.08712465146009175,
-      "accuracy": 0.96,
-      "n": 300
-    },
-    "layers": {
-      "fc1.weight": {
-        "kept": 22,
-        "total": 64,
-        "sparsity": 0.65625,
-        "units_without_inputs": 18,
-        "units_without_outputs": 17
-      },
-      "fc2.weight": {
-        "kept": 28,
-        "total": 512,
-        "sparsity": 0.9453125,
-        "units_without_inputs": 8,
-        "units_without_outputs": 9
-      },
-      "fc3.weight": {
-        "kept": 11,
-        "total": 32,
-        "sparsity": 0.65625,
-        "units_without_inputs": 0
-      }
+    "fc3.weight": {
+      "kept": 11,
+      "total": 32,
+      "sparsity": 0.65625,
+      "units_without_inputs": 0
     }
   }
 }

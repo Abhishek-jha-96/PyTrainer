@@ -1,24 +1,12 @@
-"""Global saliency pruning for Linear weights.
+"""Global Taylor-saliency pruning with an exact connection budget.
 
-Components:
-    SaliencyTracker  per-weight EMA of a pruning score, updated every minibatch
-    cubic_sparsity   gradual sparsity schedule (Zhu & Gupta, 2017)
-    select_masks     global top-k selection with per-layer safeguards
-    Pruner           ties the three together and owns the binary masks
+Only weight matrices are eligible. Biases are never pruned, so ``sparsity()``
+is the fraction of weight connections removed, not of all trainable
+parameters.
 
-Scores (``criterion``):
-    "taylor_abs"  |w * g_b|      first-order Taylor estimate of the loss change
-    "taylor_sq"   (w * g_b)**2   averaged: w^2 * diag(empirical Fisher), an
-                                 OBD-style second-order saliency
-    "magnitude"   |w|            baseline
-
-``g_b`` is the gradient of the *minibatch* mean loss. The absolute value
-(or square) is taken per minibatch and only then averaged by the EMA:
-averaging gradients first would collapse the scores toward the
-near-zero full-dataset gradient of a trained network.
-
-Only weights are pruned; biases stay dense. Masks are monotone: a pruned
-connection never regrows.
+The layer's mask Tensor (``Linear.weight_mask``) is the single source of
+truth for which connections exist. The pruner reads masks from those Tensors
+and writes them back in place; it keeps no second copy that could drift.
 """
 
 import numpy as np
@@ -26,191 +14,277 @@ import numpy as np
 CRITERIA = ("taylor_abs", "taylor_sq", "magnitude")
 
 
-# ----------------------------------------------------------------------
-# Scores
-# ----------------------------------------------------------------------
-def instantaneous_saliency(weight, grad, criterion):
-    if criterion == "taylor_abs":
-        return np.abs(weight * grad)
-    if criterion == "taylor_sq":
-        return (weight * grad) ** 2
-    if criterion == "magnitude":
-        return np.abs(weight)
-    raise ValueError(f"unknown criterion {criterion!r}; choose from {CRITERIA}")
+def cubic_sparsity(epoch, start_epoch, end_epoch, target=0.90):
+    """s(t) = s_f * [1 - (1 - u)^3], u = clip((t - t0) / (t1 - t0), 0, 1)."""
+    if not 0.0 <= target < 1.0:
+        raise ValueError("target must be in [0, 1).")
+    if end_epoch <= start_epoch:
+        raise ValueError("end_epoch must exceed start_epoch.")
+    if epoch <= start_epoch:
+        return 0.0
+    if epoch >= end_epoch:
+        return float(target)
+    progress = (epoch - start_epoch) / (end_epoch - start_epoch)
+    return float(target * (1.0 - (1.0 - progress) ** 3))
 
 
-class SaliencyTracker:
-    """Bias-corrected exponential moving average of per-weight saliency.
+def removal_budget(target_sparsity, total):
+    """Exact number of connections to remove, rounded half up."""
+    return int(np.floor(target_sparsity * total + 0.5))
 
-    ``update()`` must be called after ``loss.backward()`` and before
-    ``optimizer.step()``, so each weight is paired with the gradient
-    computed at that weight.
+
+class GlobalTaylorPruner:
+    """Rank all eligible weights together and prune to an exact count.
+
+    Parameters
+    ----------
+    named_weights : mapping name -> weight Tensor (``.data``, ``.grad``).
+        Insertion order fixes the deterministic tie-breaking order.
+    mask_tensors : mapping name -> non-trainable mask Tensor of the same
+        shape, holding only 0 and 1. Updated in place.
+    ema_decay : EMA decay per observed minibatch.
+    criterion : "taylor_abs" |w*g|, "taylor_sq" (w*g)^2, or "magnitude" |w|.
+    min_keep_fraction : each layer keeps at least ceil(f * layer size)
+        weights (0 disables the floor).
+    output_name : optional name of the output weight, shape (in, out);
+        every output unit then keeps at least ``min_per_output_unit`` inputs
+        (or all it still has, if fewer are alive).
     """
 
-    def __init__(self, named_weights, criterion="taylor_abs", decay=0.9):
+    def __init__(
+        self,
+        named_weights,
+        mask_tensors,
+        ema_decay=0.90,
+        criterion="taylor_abs",
+        min_keep_fraction=0.05,
+        output_name=None,
+        min_per_output_unit=1,
+    ):
+        named_weights = dict(named_weights)
+        mask_tensors = dict(mask_tensors)
+
+        if not 0.0 <= ema_decay < 1.0:
+            raise ValueError("ema_decay must be in [0, 1).")
         if criterion not in CRITERIA:
-            raise ValueError(f"unknown criterion {criterion!r}; choose from {CRITERIA}")
-        if not 0.0 <= decay < 1.0:
-            raise ValueError(f"decay must be in [0, 1), got {decay}")
-        self.named_weights = list(named_weights)
+            raise ValueError(f"criterion must be one of {CRITERIA}.")
+        if not 0.0 <= min_keep_fraction <= 1.0:
+            raise ValueError("min_keep_fraction must be in [0, 1].")
+        if not named_weights:
+            raise ValueError("No eligible weights.")
+        if set(named_weights) != set(mask_tensors):
+            raise ValueError("Weights and masks must have matching keys.")
+        if min_per_output_unit < 0:
+            raise ValueError("min_per_output_unit must be >= 0.")
+        if output_name is not None and output_name not in named_weights:
+            raise ValueError(f"Unknown output_name {output_name!r}.")
+
+        self.names = list(named_weights)
+        self.weights = named_weights
+        self.mask_tensors = mask_tensors
+        self.ema_decay = ema_decay
         self.criterion = criterion
-        self.decay = decay
-        self.ema = {name: np.zeros_like(w.data) for name, w in self.named_weights}
-        self.updates = 0
-
-    def update(self):
-        self.updates += 1
-        b = self.decay
-        for name, w in self.named_weights:
-            if w.grad is None and self.criterion != "magnitude":
-                raise RuntimeError(f"{name} has no gradient; call after backward()")
-            g = w.grad if w.grad is not None else np.zeros_like(w.data)
-            s = instantaneous_saliency(w.data, g, self.criterion)
-            ema = self.ema[name]
-            ema *= b
-            ema += (1.0 - b) * s
-
-    def scores(self):
-        """Bias-corrected scores (no start-up shrinkage toward zero)."""
-        if self.updates == 0:
-            raise RuntimeError("no saliency measurements yet")
-        correction = 1.0 - self.decay**self.updates
-        return {name: ema / correction for name, ema in self.ema.items()}
-
-
-# ----------------------------------------------------------------------
-# Schedule
-# ----------------------------------------------------------------------
-def cubic_sparsity(event, num_events, initial=0.0, final=0.9):
-    """Sparsity target at pruning event ``event`` (0 .. num_events).
-
-        s_k = s_f + (s_i - s_f) * (1 - k / n)**3
-
-    Front-loaded: prunes fast while many redundant weights remain and
-    slows near the target. Clamped to ``final`` after the last event.
-    """
-    if num_events <= 0:
-        raise ValueError("num_events must be positive")
-    if not 0.0 <= initial <= final < 1.0:
-        raise ValueError(f"need 0 <= initial <= final < 1, got {initial}, {final}")
-    k = min(max(event, 0), num_events)
-    return final + (initial - final) * (1.0 - k / num_events) ** 3
-
-
-# ----------------------------------------------------------------------
-# Mask selection
-# ----------------------------------------------------------------------
-def select_masks(scores, current_masks, sparsity, min_keep_fraction=0.05,
-                 output_layer=None, min_per_output_unit=1):
-    """Choose which weights survive, ranking all layers together.
-
-    Steps:
-      1. Only currently alive weights are candidates (monotone masks).
-      2. Reserve per-layer floors: the top ``ceil(min_keep_fraction * size)``
-         weights of every layer, and the top ``min_per_output_unit``
-         incoming weights of every unit in ``output_layer`` (so every class
-         logit keeps a connection).
-      3. Fill the remaining budget with the globally highest scores.
-
-    Returns new masks (bool arrays); total kept = round((1 - sparsity) * total),
-    unless the floors alone require more.
-    """
-    if not 0.0 <= sparsity < 1.0:
-        raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
-
-    names = list(scores)
-    total = sum(scores[n].size for n in names)
-    budget = int(round((1.0 - sparsity) * total))
-
-    keep = {n: np.zeros(scores[n].shape, dtype=bool) for n in names}
-    ranked = {}
-    for n in names:
-        s = np.where(current_masks[n], scores[n], -np.inf)
-        ranked[n] = s
-
-    def take_top(n, flat_candidates, k):
-        s = ranked[n].ravel()
-        order = flat_candidates[np.argsort(-s[flat_candidates], kind="stable")]
-        order = order[np.isfinite(s[order])][:k]
-        keep[n].ravel()[order] = True
-
-    # 2a. per-layer floors
-    for n in names:
-        floor = int(np.ceil(min_keep_fraction * scores[n].size))
-        take_top(n, np.arange(scores[n].size), floor)
-
-    # 2b. per-output-unit guarantee (columns of a (fan_in, fan_out) weight)
-    if output_layer is not None and min_per_output_unit > 0:
-        s = ranked[output_layer]
-        for j in range(s.shape[1]):
-            col = np.ravel_multi_index((np.arange(s.shape[0]), np.full(s.shape[0], j)), s.shape)
-            take_top(output_layer, col, min_per_output_unit)
-
-    # 3. global fill
-    reserved = sum(int(k.sum()) for k in keep.values())
-    remaining = budget - reserved
-    if remaining > 0:
-        flat = np.concatenate([np.where(keep[n], -np.inf, ranked[n]).ravel() for n in names])
-        owner = np.concatenate([np.full(scores[n].size, i) for i, n in enumerate(names)])
-        local = np.concatenate([np.arange(scores[n].size) for n in names])
-        order = np.argsort(-flat, kind="stable")
-        order = order[np.isfinite(flat[order])][:remaining]
-        for i, n in enumerate(names):
-            keep[n].ravel()[local[order[owner[order] == i]]] = True
-
-    return {n: keep[n] & current_masks[n] for n in names}
-
-
-# ----------------------------------------------------------------------
-# Pruner
-# ----------------------------------------------------------------------
-class Pruner:
-    """Owns the weight masks and applies them to the model and optimizer."""
-
-    def __init__(self, named_weights, optimizer, criterion="taylor_abs", decay=0.9,
-                 min_keep_fraction=0.05, output_layer=None, min_per_output_unit=1):
-        self.named_weights = list(named_weights)
-        self.weights = dict(self.named_weights)
-        self.optimizer = optimizer
-        self.tracker = SaliencyTracker(self.named_weights, criterion, decay)
         self.min_keep_fraction = min_keep_fraction
-        self.output_layer = output_layer
-        self.min_per_output_unit = min_per_output_unit
-        self.masks = {n: np.ones(w.shape, dtype=bool) for n, w in self.named_weights}
-        for n, w in self.named_weights:
-            optimizer.set_mask(w, self.masks[n])
+        self.output_name = output_name
+        self.min_per_output_unit = int(min_per_output_unit)
 
-    def update_scores(self):
-        self.tracker.update()
+        for name in self.names:
+            w = self.weights[name].data
+            m = self.mask_tensors[name].data
+            if w.shape != m.shape:
+                raise ValueError(f"Mask shape mismatch for {name}.")
+            if not np.all((m == 0) | (m == 1)):
+                raise ValueError(f"Mask for {name} must contain only 0 and 1.")
+        if output_name is not None and self.weights[output_name].data.ndim != 2:
+            raise ValueError("output_name must refer to a 2-D weight.")
 
-    def prune_to(self, sparsity):
-        new = select_masks(
-            self.tracker.scores(), self.masks, sparsity,
-            self.min_keep_fraction, self.output_layer, self.min_per_output_unit,
-        )
-        self.masks = new
-        for n, w in self.named_weights:
-            self.optimizer.set_mask(w, new[n])  # zeroes weights and resets moments
+        self.scores = {
+            name: np.zeros(self.weights[name].data.shape, dtype=np.float64)
+            for name in self.names
+        }
+        self._steps = {name: 0 for name in self.names}
+        self._expected = {name: self.mask(name).copy() for name in self.names}
+        self.safeguard_kept = 0
+
+    # ------------------------------------------------------------------ masks
+    def mask(self, name):
+        """Boolean mask read from the layer's mask Tensor (a fresh array)."""
+        return np.asarray(self.mask_tensors[name].data) != 0
+
+    @property
+    def masks(self):
+        return {name: self.mask(name) for name in self.names}
+
+    def _write_mask(self, name, new_mask):
+        target = self.mask_tensors[name].data
+        target[...] = new_mask.astype(target.dtype)  # in place: identity kept
+        self._expected[name] = new_mask.copy()
+
+    # --------------------------------------------------------------- saliency
+    def observe(self):
+        """Update scores. Call after backward() and before optimizer.step()."""
+        if self.criterion == "magnitude":
+            return
+        for name in self.names:
+            param = self.weights[name]
+            if param.grad is None:
+                continue
+            w = np.asarray(param.data, dtype=np.float64)
+            g = np.asarray(param.grad, dtype=np.float64)
+            if g.shape != w.shape:
+                raise ValueError(f"Gradient shape mismatch for {name}.")
+            if not np.all(np.isfinite(g)):
+                raise FloatingPointError(f"Non-finite gradient in {name}.")
+
+            wg = w * g  # per-minibatch product; abs/square before averaging
+            current = np.abs(wg) if self.criterion == "taylor_abs" else wg * wg
+            current = np.where(self.mask(name), current, 0.0)
+
+            score = self.scores[name]
+            score *= self.ema_decay
+            score += (1.0 - self.ema_decay) * current
+            self._steps[name] += 1
+
+    def saliency(self, name):
+        """Bias-corrected EMA score (or |w| for the magnitude criterion)."""
+        if self.criterion == "magnitude":
+            return np.abs(np.asarray(self.weights[name].data, dtype=np.float64))
+        t = self._steps[name]
+        if t == 0:
+            return np.zeros_like(self.scores[name])
+        return self.scores[name] / (1.0 - self.ema_decay ** t)
+
+    # ---------------------------------------------------------------- pruning
+    def _protected(self, name, mask, score):
+        """Flat (C-order) boolean array of alive weights kept by safeguards."""
+        flat_mask = mask.reshape(-1)
+        flat_score = score.reshape(-1)
+        protected = np.zeros(flat_mask.size, dtype=bool)
+        alive = np.flatnonzero(flat_mask)
+
+        floor = int(np.ceil(self.min_keep_fraction * flat_mask.size))
+        floor = min(floor, alive.size)
+        if floor:
+            order = np.argsort(-flat_score[alive], kind="stable")
+            protected[alive[order[:floor]]] = True
+
+        if name == self.output_name and self.min_per_output_unit:
+            for j in range(mask.shape[1]):
+                rows = np.flatnonzero(mask[:, j])
+                top = rows[np.argsort(-score[rows, j], kind="stable")]
+                for i in top[: self.min_per_output_unit]:
+                    protected[np.ravel_multi_index((i, j), mask.shape)] = True
+        return protected
+
+    def prune_to(self, target_sparsity, optimizer=None):
+        """Prune the lowest-scoring alive weights to an exact global count.
+
+        Monotonic: pruned weights never regrow. Returns the new sparsity.
+        """
+        if not 0.0 <= target_sparsity < 1.0:
+            raise ValueError("target_sparsity must be in [0, 1).")
+
+        masks = self.masks
+        total = sum(m.size for m in masks.values())
+        target_removed = removal_budget(target_sparsity, total)
+        already_removed = sum(int(np.count_nonzero(~m)) for m in masks.values())
+        if target_removed < already_removed:
+            raise ValueError("Target sparsity cannot decrease for a monotonic pruner.")
+
+        number_to_remove = target_removed - already_removed
+        self.safeguard_kept = 0
+
+        if number_to_remove:
+            if self.criterion != "magnitude" and not any(self._steps.values()):
+                raise ValueError("No saliency observed; call observe() before pruning.")
+            new_masks = self._select(masks, number_to_remove)
+            for name in self.names:
+                self._write_mask(name, new_masks[name])
+
+        self.enforce(optimizer)
         return self.sparsity()
 
+    def _select(self, masks, number_to_remove):
+        owners, indices, scores, protected = [], [], [], []
+        for k, name in enumerate(self.names):
+            mask = masks[name]
+            score = self.saliency(name)
+            alive = np.flatnonzero(mask.reshape(-1))
+            owners.append(np.full(alive.size, k))
+            indices.append(alive)
+            scores.append(score.reshape(-1)[alive])
+            protected.append(self._protected(name, mask, score)[alive])
+
+        owners = np.concatenate(owners)
+        indices = np.concatenate(indices)
+        scores = np.concatenate(scores)
+        protected = np.concatenate(protected)
+
+        if not np.all(np.isfinite(scores)):
+            raise FloatingPointError("Non-finite saliency scores.")
+
+        candidates = np.flatnonzero(~protected)
+        if number_to_remove > candidates.size:
+            raise ValueError(
+                f"Cannot remove {number_to_remove} weights: only "
+                f"{candidates.size} are alive and not held by safeguards."
+            )
+
+        # Stable sort: ties break by parameter order, then flat index.
+        order = np.argsort(scores[candidates], kind="stable")
+        selected = candidates[order[:number_to_remove]]
+
+        # Diagnostic: survivors that exist only because of the safeguards.
+        unconstrained = np.argsort(scores, kind="stable")[:number_to_remove]
+        self.safeguard_kept = int(np.count_nonzero(protected[unconstrained]))
+
+        new_masks = {}
+        for k, name in enumerate(self.names):
+            flat = masks[name].reshape(-1).copy()  # explicit copy, no view reliance
+            flat[indices[selected[owners[selected] == k]]] = False
+            new_masks[name] = flat.reshape(masks[name].shape)
+        return new_masks
+
+    # ------------------------------------------------------------ enforcement
+    def enforce(self, optimizer=None):
+        """Zero pruned weights and gradients; push masks to MaskedAdam."""
+        for name in self.names:
+            mask = self.mask(name)
+            param = self.weights[name]
+            param.data[~mask] = 0.0
+            if param.grad is not None:
+                param.grad[~mask] = 0.0
+            if optimizer is not None:
+                if not hasattr(optimizer, "set_mask"):
+                    raise TypeError("Optimizer must implement set_mask(param, mask).")
+                optimizer.set_mask(param, mask)
+
+    def check_integrity(self):
+        """Raise if a mask Tensor changed outside prune_to, or a pruned raw
+        weight is nonzero."""
+        for name in self.names:
+            m = np.asarray(self.mask_tensors[name].data)
+            if not np.all((m == 0) | (m == 1)):
+                raise ValueError(f"Mask for {name} contains values other than 0 and 1.")
+            mask = m != 0
+            if not np.array_equal(mask, self._expected[name]):
+                raise RuntimeError(f"Mask for {name} was modified outside the pruner.")
+            if np.any(np.asarray(self.weights[name].data)[~mask] != 0):
+                raise RuntimeError(f"Pruned raw weights of {name} are nonzero.")
+
+    # -------------------------------------------------------------- reporting
     def sparsity(self):
-        kept = sum(int(m.sum()) for m in self.masks.values())
-        total = sum(m.size for m in self.masks.values())
-        return 1.0 - kept / total
+        """Fraction of eligible weight connections removed (biases excluded)."""
+        masks = self.masks
+        total = sum(m.size for m in masks.values())
+        removed = sum(int(np.count_nonzero(~m)) for m in masks.values())
+        return removed / total
 
     def layer_report(self):
-        """Per-layer kept counts and unit connectivity diagnostics."""
-        names = [n for n, _ in self.named_weights]
-        out = {}
-        for i, n in enumerate(names):
-            m = self.masks[n]
-            info = {"kept": int(m.sum()), "total": m.size,
-                    "sparsity": 1.0 - m.sum() / m.size}
-            # Units produced by this layer: column j has no incoming weights.
-            info["units_without_inputs"] = int(np.sum(~m.any(axis=0)))
-            if i + 1 < len(names):
-                nxt = self.masks[names[i + 1]]
-                # Units whose outgoing row in the next layer is fully pruned.
-                info["units_without_outputs"] = int(np.sum(~nxt.any(axis=1)))
-            out[n] = info
-        return out
+        """{name: {"kept", "total", "sparsity"}} per eligible weight."""
+        report = {}
+        for name, m in self.masks.items():
+            kept, total = int(np.count_nonzero(m)), int(m.size)
+            report[name] = {"kept": kept, "total": total,
+                            "sparsity": 1.0 - kept / total}
+        return report
