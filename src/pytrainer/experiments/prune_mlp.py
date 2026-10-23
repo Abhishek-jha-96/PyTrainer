@@ -115,8 +115,10 @@ def build_pruner(model, config):
     )
 
 
-def check_masks_hold(pruner):
-    pruner.check_integrity()
+def check_masks_hold(pruner, optimizer):
+    """Weights, gradients, Adam m and v are exactly 0 at pruned entries,
+    and the optimizer's mask equals the layer mask."""
+    pruner.check_integrity(optimizer)
 
 
 def train_epoch(model, optimizer, pruner, data, config, rng, named_params, track):
@@ -130,6 +132,8 @@ def train_epoch(model, optimizer, pruner, data, config, rng, named_params, track
         if track:
             pruner.observe()  # weight and gradient from the same point
         optimizer.step()
+        pruner.enforce(optimizer)  # momentum and rounding can't revive pruned weights
+        check_masks_hold(pruner, optimizer)  # invariant after every update
 
 
 def train_with_pruning(config, data):
@@ -167,7 +171,7 @@ def train_with_pruning(config, data):
         if is_prune_epoch(epoch, config):
             pruner.prune_to(target_sparsity(epoch, config), optimizer=optimizer)
             safeguard_log.append(pruner.safeguard_kept)
-        check_masks_hold(pruner)
+        check_masks_hold(pruner, optimizer)
         val_loss = record(epoch)
 
         if epoch >= config.end_epoch and val_loss < best_val:  # select only at target sparsity
@@ -178,7 +182,7 @@ def train_with_pruning(config, data):
         raise RuntimeError("no epoch at target sparsity produced a finite validation loss")
     for p, b in zip(model.parameters(), best):
         p.data[...] = b
-    check_masks_hold(pruner)
+    check_masks_hold(pruner, optimizer)
     return {"model": model, "pruner": pruner, "history": history,
             "best_epoch": best_epoch, "safeguard_log": safeguard_log}
 

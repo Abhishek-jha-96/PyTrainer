@@ -3,6 +3,18 @@ import numpy as np
 from pytrainer.autodiff.tensor import Tensor
 
 
+def _as_bool_mask(param, mask):
+    """Validate a keep-mask (True/1 = connection exists) for ``param``."""
+    mask = np.asarray(mask)
+    if mask.shape != param.data.shape:
+        raise ValueError(f"mask shape {mask.shape} != parameter shape {param.data.shape}")
+    if mask.dtype != bool:
+        if not np.all((mask == 0) | (mask == 1)):
+            raise ValueError("mask must contain only 0 and 1 (or be boolean)")
+        mask = mask != 0
+    return mask
+
+
 class Adam:
     """Adam optimizer (Kingma & Ba, 2015), no weight decay.
 
@@ -31,6 +43,14 @@ class Adam:
           zero moments the update is exactly 0, so the parameter does not
           move; with nonzero moments from earlier steps, momentum still
           moves it, as in standard Adam.
+
+    Masking:
+        ``mask_state(param, mask)`` clears ``m`` and ``v`` at pruned
+        entries. On its own this is a one-off reset: plain Adam does not
+        remember the mask, so a later nonzero gradient at a pruned entry
+        would rebuild momentum. Use ``MaskedAdam`` for masks that must hold
+        on every step, or call ``mask_state`` (with the weights zeroed)
+        after every ``step()``.
     """
 
     def __init__(
@@ -75,8 +95,34 @@ class Adam:
         self.m = [np.zeros_like(p.data) for p in params]
         self.v = [np.zeros_like(p.data) for p in params]
 
+        # Tensor identity -> slot in self.m / self.v.
+        self._index = {id(p): i for i, p in enumerate(params)}
+
         # One counter per optimizer step, shared by all parameters.
         self.t = 0
+
+    def _slot(self, param):
+        i = self._index.get(id(param))
+        if i is None:
+            raise ValueError("parameter is not managed by this optimizer")
+        return i
+
+    def moments(self, param):
+        """The live (m, v) state arrays for ``param`` (not copies)."""
+        i = self._slot(param)
+        return self.m[i], self.v[i]
+
+    def mask_state(self, param, mask):
+        """Clear Adam's first and second moments at pruned entries.
+
+        ``mask`` is a keep-mask: True (or 1) where the connection exists,
+        False (or 0) where it was pruned. Entries that are kept are not
+        touched.
+        """
+        i = self._slot(param)
+        mask = _as_bool_mask(param, mask)
+        self.m[i][~mask] = 0.0
+        self.v[i][~mask] = 0.0
 
     def zero_grad(self):
         """Clear gradients before the next minibatch's backward pass."""
@@ -129,40 +175,51 @@ class Adam:
 
 
 class MaskedAdam(Adam):
-    """Adam that keeps pruned weights exactly at zero.
- 
-    For a masked-out entry the optimizer:
-      * resets its first and second moments when the mask is set, so no
-        stored momentum can move it later;
-      * zeroes its gradient before every update;
-      * re-applies the mask to the weight after every update.
- 
-    Unmasked parameters (e.g. biases) behave exactly like plain Adam.
+    """Adam that keeps pruned weights exactly at zero on every step.
+
+    After ``set_mask(param, mask)``, for every pruned entry and after every
+    ``step()``:
+
+      * the weight is exactly 0;
+      * the gradient the optimizer used (and left in ``param.grad``) is 0;
+      * the first and second moments are exactly 0.
+
+    Why each part is needed: zeroing only the weight once is not enough,
+    because a nonzero m_{t-1} moves the weight even when g_t = 0. Zeroing
+    the gradient before the moment update keeps m and v at 0, so the update
+    is exactly 0 / (0 + eps) = 0. The moments are cleared again after the
+    update so the invariant holds structurally, not only arithmetically.
+
+    The mask is stored by the optimizer as a plain boolean array; it is
+    never a parameter and is never updated by ``step()``. Unmasked
+    parameters (e.g. biases) behave exactly like plain Adam.
     """
- 
+
     def __init__(self, parameters, **kwargs):
         super().__init__(parameters, **kwargs)
-        self._index = {id(p): i for i, p in enumerate(self.parameters)}
         self.masks = [None] * len(self.parameters)
- 
+
     def set_mask(self, param, mask):
-        i = self._index.get(id(param))
-        if i is None:
-            raise ValueError("parameter is not managed by this optimizer")
-        mask = np.asarray(mask, dtype=bool)
-        if mask.shape != param.data.shape:
-            raise ValueError(f"mask shape {mask.shape} != parameter shape {param.data.shape}")
+        """Install a keep-mask; zero pruned weights, gradients, m and v."""
+        i = self._slot(param)
+        mask = _as_bool_mask(param, mask).copy()  # own copy: callers can't alias it
         self.masks[i] = mask
-        self.m[i][~mask] = 0.0
-        self.v[i][~mask] = 0.0
+        self.mask_state(param, mask)
         param.data[~mask] = 0.0
- 
+        if param.grad is not None:
+            param.grad = np.where(mask, param.grad, 0.0)
+
+    def mask_of(self, param):
+        """The stored keep-mask for ``param``, or None if it is unmasked."""
+        return self.masks[self._slot(param)]
+
     def step(self):
         for p, mask in zip(self.parameters, self.masks):
             if mask is not None and p.grad is not None:
                 p.grad = np.where(mask, p.grad, 0.0)
         super().step()
-        for p, mask in zip(self.parameters, self.masks):
+        for i, (p, mask) in enumerate(zip(self.parameters, self.masks)):
             if mask is not None:
                 p.data[~mask] = 0.0
- 
+                self.m[i][~mask] = 0.0
+                self.v[i][~mask] = 0.0

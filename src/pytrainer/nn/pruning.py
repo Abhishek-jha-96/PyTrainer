@@ -247,7 +247,23 @@ class GlobalTaylorPruner:
 
     # ------------------------------------------------------------ enforcement
     def enforce(self, optimizer=None):
-        """Zero pruned weights and gradients; push masks to MaskedAdam."""
+        """Restore the masking invariant for every eligible weight.
+
+        Zeroes pruned weights and gradients, then hands the mask to the
+        optimizer: ``set_mask`` (MaskedAdam, which also remembers it) when
+        available, otherwise ``mask_state`` (plain Adam, which only clears
+        m and v). Safe to call after every ``optimizer.step()``.
+        """
+        if optimizer is not None:
+            if hasattr(optimizer, "set_mask"):
+                push = optimizer.set_mask
+            elif hasattr(optimizer, "mask_state"):
+                push = optimizer.mask_state
+            else:
+                raise TypeError(
+                    "Optimizer must implement set_mask(param, mask) "
+                    "or mask_state(param, mask)."
+                )
         for name in self.names:
             mask = self.mask(name)
             param = self.weights[name]
@@ -255,13 +271,18 @@ class GlobalTaylorPruner:
             if param.grad is not None:
                 param.grad[~mask] = 0.0
             if optimizer is not None:
-                if not hasattr(optimizer, "set_mask"):
-                    raise TypeError("Optimizer must implement set_mask(param, mask).")
-                optimizer.set_mask(param, mask)
+                push(param, mask)
 
-    def check_integrity(self):
-        """Raise if a mask Tensor changed outside prune_to, or a pruned raw
-        weight is nonzero."""
+    def check_integrity(self, optimizer=None):
+        """Raise unless the masking invariant holds for every eligible weight.
+
+        Always checked: masks hold only 0/1, were changed only by the
+        pruner, and pruned raw weights are exactly 0; pruned gradients, if
+        present, are exactly 0. With an optimizer that exposes
+        ``moments(param)``, Adam's m and v must be exactly 0 at pruned
+        entries; with ``mask_of(param)``, its stored mask must equal the
+        layer mask.
+        """
         for name in self.names:
             m = np.asarray(self.mask_tensors[name].data)
             if not np.all((m == 0) | (m == 1)):
@@ -269,8 +290,21 @@ class GlobalTaylorPruner:
             mask = m != 0
             if not np.array_equal(mask, self._expected[name]):
                 raise RuntimeError(f"Mask for {name} was modified outside the pruner.")
-            if np.any(np.asarray(self.weights[name].data)[~mask] != 0):
+            param = self.weights[name]
+            if np.any(np.asarray(param.data)[~mask] != 0):
                 raise RuntimeError(f"Pruned raw weights of {name} are nonzero.")
+            if param.grad is not None and np.any(np.asarray(param.grad)[~mask] != 0):
+                raise RuntimeError(f"Pruned gradients of {name} are nonzero.")
+            if optimizer is None:
+                continue
+            if hasattr(optimizer, "moments"):
+                first, second = optimizer.moments(param)
+                if np.any(first[~mask] != 0) or np.any(second[~mask] != 0):
+                    raise RuntimeError(f"Adam moments of {name} are nonzero at pruned entries.")
+            if hasattr(optimizer, "mask_of"):
+                stored = optimizer.mask_of(param)
+                if stored is not None and not np.array_equal(stored, mask):
+                    raise RuntimeError(f"Optimizer mask for {name} differs from the layer mask.")
 
     # -------------------------------------------------------------- reporting
     def sparsity(self):
