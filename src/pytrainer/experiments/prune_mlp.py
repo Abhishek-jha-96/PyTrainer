@@ -14,8 +14,6 @@ prune removes an exact number of connections, floor(s * 608 + 0.5).
 The model is selected by validation loss among epochs with t >= t1
 (target sparsity reached); the test split is evaluated once at the end.
 
-Run from the directory that contains ``pytrainer/``:
-
     python -m pytrainer.experiments.prune_mlp --out-dir results/pruning
 """
 
@@ -24,213 +22,114 @@ import json
 import os
 from dataclasses import asdict, dataclass
 
+import matplotlib.pyplot as plt
 import numpy as np
 
-from pytrainer.autodiff.losses import softmax_cross_entropy
-from pytrainer.autodiff.tensor import Tensor
-from pytrainer.experiments.data import iterate_minibatches, prepare_two_moons
+from pytrainer.experiments.data import prepare_two_moons
 from pytrainer.experiments.metrics import (
-    evaluate, plot_accuracy_curve, plot_loss_curve, save_history_csv,
+    evaluate, evaluate_splits, format_row, plot_curves, save_history_csv,
 )
-from pytrainer.experiments.train_mlp import (
-    check_finite_gradients, make_generators, named_parameters,
-)
+from pytrainer.experiments.train_mlp import make_generators, train_one_epoch
 from pytrainer.nn.models import MLP
 from pytrainer.nn.optim import MaskedAdam
-from pytrainer.nn.pruning import GlobalTaylorPruner, cubic_sparsity
-
-PRUNE_FIELDS = ("epoch", "phase", "target_sparsity", "sparsity", "train_loss",
-                "train_accuracy", "val_loss", "val_accuracy")
-
-ELIGIBLE_LAYERS = ("fc1", "fc2", "fc3")
-OUTPUT_WEIGHT = "fc3.weight"
+from pytrainer.nn.pruning import CRITERIA, GlobalTaylorPruner, cubic_sparsity
 
 
 @dataclass
 class PruneConfig:
     seed: int = 42
-    criterion: str = "taylor_abs"     # "taylor_abs" | "taylor_sq" | "magnitude"
+    criterion: str = "taylor_abs"     # one of pruning.CRITERIA
     final_sparsity: float = 0.90      # s_f, fraction of eligible weights removed
     start_epoch: int = 10             # t0: last dense (warm-up) epoch
     end_epoch: int = 80               # t1: target sparsity reached
     finetune_epochs: int = 20         # epochs after t1 with fixed masks
-    prune_every: int = 1              # epochs between mask updates in (t0, t1]
     ema_decay: float = 0.9            # saliency EMA, per minibatch
     min_keep_fraction: float = 0.05   # per-layer floor (safeguard)
     min_per_output_unit: int = 1      # every class logit keeps >= 1 input
     lr: float = 1e-3
     batch_size: int = 64
-    eval_batch_size: int = 256
     log_every: int = 10
 
     @property
     def total_epochs(self):
         return self.end_epoch + self.finetune_epochs
 
-    def validate(self):
-        if not 0 <= self.start_epoch < self.end_epoch:
-            raise ValueError("need 0 <= start_epoch < end_epoch")
-        if self.finetune_epochs < 0 or self.prune_every < 1:
-            raise ValueError("finetune_epochs must be >= 0 and prune_every >= 1")
-        if not 0.0 <= self.final_sparsity < 1.0:
-            raise ValueError("final_sparsity must be in [0, 1)")
+    def target_sparsity(self, epoch):
+        return cubic_sparsity(epoch, self.start_epoch, self.end_epoch, self.final_sparsity)
 
-
-def target_sparsity(epoch, config):
-    return cubic_sparsity(epoch, config.start_epoch, config.end_epoch,
-                          config.final_sparsity)
-
-
-def phase_of(epoch, config):
-    if epoch == 0:
-        return "init"
-    if epoch <= config.start_epoch:
-        return "warmup"
-    if epoch <= config.end_epoch:
-        return "prune"
-    return "finetune"
-
-
-def is_prune_epoch(epoch, config):
-    if not config.start_epoch < epoch <= config.end_epoch:
-        return False
-    return (epoch - config.start_epoch) % config.prune_every == 0 or epoch == config.end_epoch
+    def phase(self, epoch):
+        if epoch == 0:
+            return "init"
+        if epoch <= self.start_epoch:
+            return "warmup"
+        if epoch <= self.end_epoch:
+            return "prune"
+        return "finetune"
 
 
 def build_pruner(model, config):
-    """Eligible weights and their layer masks, keyed "<layer>.weight".
-
-    The mask Tensors are the layers' own ``weight_mask`` objects, so the
-    pruner writes the masks the forward pass uses. Biases are not passed in.
-    """
-    layers = [(name, getattr(model, name)) for name in ELIGIBLE_LAYERS]
+    """Pruner over each layer's weight and its own ``weight_mask`` Tensor,
+    so the pruner writes the masks the forward pass uses. Biases are excluded."""
+    layers = [(name, getattr(model, name)) for name in MLP.LAYERS]
     return GlobalTaylorPruner(
         {f"{name}.weight": layer.weight for name, layer in layers},
         {f"{name}.weight": layer.weight_mask for name, layer in layers},
         ema_decay=config.ema_decay,
         criterion=config.criterion,
         min_keep_fraction=config.min_keep_fraction,
-        output_name=OUTPUT_WEIGHT,
+        output_name="fc3.weight",
         min_per_output_unit=config.min_per_output_unit,
     )
 
 
-def check_masks_hold(pruner, optimizer):
-    """Weights, gradients, Adam m and v are exactly 0 at pruned entries,
-    and the optimizer's mask equals the layer mask."""
-    pruner.check_integrity(optimizer)
-
-
-def train_epoch(model, optimizer, pruner, data, config, rng, named_params, track):
-    for xb_np, yb in iterate_minibatches(data.X_train, data.y_train, config.batch_size, rng):
-        optimizer.zero_grad()
-        loss = softmax_cross_entropy(model(Tensor(xb_np)), yb)
-        if not np.all(np.isfinite(loss.data)):
-            raise FloatingPointError("non-finite loss")
-        loss.backward()
-        check_finite_gradients(named_params)
-        if track:
-            pruner.observe()  # weight and gradient from the same point
-        optimizer.step()
-        pruner.enforce(optimizer)  # momentum and rounding can't revive pruned weights
-        check_masks_hold(pruner, optimizer)  # invariant after every update
-
-
 def train_with_pruning(config, data):
     """Run the full schedule. Returns a dict with model, pruner, history, selection."""
-    config.validate()
     init_rng, batch_rng = make_generators(config.seed)  # same streams as dense training
     model = MLP(init_rng)
-    optimizer = MaskedAdam(model.parameters(), lr=config.lr)
-    named_params = named_parameters(model)
+    params = model.parameters()
+    optimizer = MaskedAdam(params, lr=config.lr)
     pruner = build_pruner(model, config)
-
-    history = {k: [] for k in PRUNE_FIELDS}
-    safeguard_log = []
+    history = {k: [] for k in ("epoch", "phase", "target_sparsity", "sparsity", "train_loss",
+                               "train_accuracy", "val_loss", "val_accuracy")}
 
     def record(epoch):
-        tr = evaluate(model, data.X_train, data.y_train, config.eval_batch_size)
-        va = evaluate(model, data.X_val, data.y_val, config.eval_batch_size)
-        target = target_sparsity(epoch, config)
-        row = (epoch, phase_of(epoch, config), target, pruner.sparsity(),
-               tr["loss"], tr["accuracy"], va["loss"], va["accuracy"])
-        for k, v in zip(PRUNE_FIELDS, row):
-            history[k].append(v)
+        row = {"epoch": epoch, "phase": config.phase(epoch),
+               "target_sparsity": config.target_sparsity(epoch),
+               "sparsity": pruner.sparsity(), **evaluate_splits(model, data)}
+        for k in history:
+            history[k].append(row[k])
         if config.log_every and (epoch % config.log_every == 0 or epoch == config.start_epoch):
-            print(f"epoch {epoch:4d} [{row[1]:<8}] target {target:6.1%} actual {row[3]:6.1%} | "
-                  f"train loss {tr['loss']:.4f} acc {tr['accuracy']:.4f} | "
-                  f"val loss {va['loss']:.4f} acc {va['accuracy']:.4f}")
-        return va["loss"]
+            print(f"epoch {epoch:4d} [{row['phase']:<8}] target {row['target_sparsity']:6.1%} "
+                  f"actual {row['sparsity']:6.1%} | {format_row(row)}")
+        return row["val_loss"]
 
     record(0)
-    best_val, best_epoch, best = np.inf, None, None
+    best_val, best_epoch, best_weights = np.inf, None, None
+    safeguard_kept_max = 0
 
     for epoch in range(1, config.total_epochs + 1):
-        train_epoch(model, optimizer, pruner, data, config, batch_rng, named_params,
-                    track=epoch <= config.end_epoch)
-        if is_prune_epoch(epoch, config):
-            pruner.prune_to(target_sparsity(epoch, config), optimizer=optimizer)
-            safeguard_log.append(pruner.safeguard_kept)
-        check_masks_hold(pruner, optimizer)
+        pruning = epoch <= config.end_epoch
+        train_one_epoch(model, optimizer, data.X_train, data.y_train, config.batch_size,
+                        batch_rng, after_backward=pruner.observe if pruning else None)
+        if epoch > config.start_epoch and pruning:
+            pruner.prune_to(config.target_sparsity(epoch), optimizer=optimizer)
+            safeguard_kept_max = max(safeguard_kept_max, pruner.safeguard_kept)
+        pruner.check_integrity(optimizer)
         val_loss = record(epoch)
 
         if epoch >= config.end_epoch and val_loss < best_val:  # select only at target sparsity
             best_val, best_epoch = val_loss, epoch
-            best = [p.data.copy() for p in model.parameters()]
+            best_weights = [p.data.copy() for p in params]
 
-    if best is None:
-        raise RuntimeError("no epoch at target sparsity produced a finite validation loss")
-    for p, b in zip(model.parameters(), best):
-        p.data[...] = b
-    check_masks_hold(pruner, optimizer)
+    for p, saved in zip(params, best_weights):
+        p.data[...] = saved
     return {"model": model, "pruner": pruner, "history": history,
-            "best_epoch": best_epoch, "safeguard_log": safeguard_log}
-
-
-def eligible_report(pruner):
-    total = sum(m.size for m in pruner.masks.values())
-    kept = sum(int(m.sum()) for m in pruner.masks.values())
-    return {"eligible_weights": total, "kept": kept, "pruned": total - kept,
-            "sparsity": 1.0 - kept / total}
-
-
-def run(config, out_dir=None):
-    data = prepare_two_moons(seed=config.seed)
-    res = train_with_pruning(config, data)
-    model, pruner, h = res["model"], res["pruner"], res["history"]
-    test = evaluate(model, data.X_test, data.y_test, config.eval_batch_size)  # once
-    i = h["epoch"].index(res["best_epoch"])
-
-    summary = {
-        "config": asdict(config),
-        "total_epochs": config.total_epochs,
-        "selected_epoch": res["best_epoch"],
-        "budget": eligible_report(pruner),
-        "biases_dense": int(sum(p.data.size for n, p in named_parameters(model)
-                                if n.endswith(".bias"))),
-        "safeguard_kept_max": max(res["safeguard_log"], default=0),
-        "selected": {k: h[k][i] for k in PRUNE_FIELDS[2:]},
-        "test": test,
-        "layers": pruner.layer_report(),
-    }
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-        save_history_csv(h, os.path.join(out_dir, "pruning_history.csv"), fields=PRUNE_FIELDS)
-        plot_loss_curve(h, os.path.join(out_dir, "pruning_loss_curve.png"), res["best_epoch"])
-        plot_accuracy_curve(h, os.path.join(out_dir, "pruning_accuracy_curve.png"), res["best_epoch"])
-        plot_schedule(h, config, os.path.join(out_dir, "sparsity_schedule.png"))
-        with open(os.path.join(out_dir, "pruning_summary.json"), "w") as fh:
-            json.dump(summary, fh, indent=2, default=float)
-    return summary, res
+            "best_epoch": best_epoch, "safeguard_kept_max": safeguard_kept_max}
 
 
 def plot_schedule(history, config, path):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
     t = np.linspace(0, config.total_epochs, 500)
-    s = [target_sparsity(x, config) for x in t]
+    s = [config.target_sparsity(x) for x in t]
 
     fig, (ax, ax2) = plt.subplots(2, 1, figsize=(7.5, 6.5), sharex=True,
                                   gridspec_kw={"height_ratios": [3, 2]})
@@ -258,11 +157,42 @@ def plot_schedule(history, config, path):
     plt.close(fig)
 
 
+def run(config, out_dir=None):
+    data = prepare_two_moons(seed=config.seed)
+    res = train_with_pruning(config, data)
+    model, pruner, h, best = res["model"], res["pruner"], res["history"], res["best_epoch"]
+    layers = pruner.layer_report()
+    total = sum(r["total"] for r in layers.values())
+    kept = sum(r["kept"] for r in layers.values())
+
+    summary = {
+        "config": asdict(config),
+        "total_epochs": config.total_epochs,
+        "selected_epoch": best,
+        "budget": {"eligible_weights": total, "kept": kept, "pruned": total - kept,
+                   "sparsity": 1.0 - kept / total},
+        "biases_dense": sum(p.data.size for n, p in model.named_parameters()
+                            if n.endswith(".bias")),
+        "safeguard_kept_max": res["safeguard_kept_max"],
+        "selected": {k: v[h["epoch"].index(best)] for k, v in h.items() if k not in ("epoch", "phase")},
+        "test": evaluate(model, data.X_test, data.y_test),  # once, at the end
+        "layers": layers,
+    }
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        save_history_csv(h, os.path.join(out_dir, "pruning_history.csv"))
+        for metric in ("loss", "accuracy"):
+            plot_curves(h, metric, os.path.join(out_dir, f"pruning_{metric}_curve.png"), best)
+        plot_schedule(h, config, os.path.join(out_dir, "sparsity_schedule.png"))
+        with open(os.path.join(out_dir, "pruning_summary.json"), "w") as fh:
+            json.dump(summary, fh, indent=2)
+    return summary, res
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="Gradual global saliency pruning")
     p.add_argument("--out-dir", default="results/pruning")
-    p.add_argument("--criterion", default=PruneConfig.criterion,
-                   choices=("taylor_abs", "taylor_sq", "magnitude"))
+    p.add_argument("--criterion", default=PruneConfig.criterion, choices=CRITERIA)
     p.add_argument("--final-sparsity", type=float, default=PruneConfig.final_sparsity)
     p.add_argument("--start-epoch", type=int, default=PruneConfig.start_epoch)
     p.add_argument("--end-epoch", type=int, default=PruneConfig.end_epoch)

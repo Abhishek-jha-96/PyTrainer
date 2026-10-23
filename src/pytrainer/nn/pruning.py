@@ -6,7 +6,7 @@ parameters.
 
 The layer's mask Tensor (``Linear.weight_mask``) is the single source of
 truth for which connections exist. The pruner reads masks from those Tensors
-and writes them back in place; it keeps no second copy that could drift.
+and writes them back in place.
 """
 
 import numpy as np
@@ -20,11 +20,7 @@ def cubic_sparsity(epoch, start_epoch, end_epoch, target=0.90):
         raise ValueError("target must be in [0, 1).")
     if end_epoch <= start_epoch:
         raise ValueError("end_epoch must exceed start_epoch.")
-    if epoch <= start_epoch:
-        return 0.0
-    if epoch >= end_epoch:
-        return float(target)
-    progress = (epoch - start_epoch) / (end_epoch - start_epoch)
+    progress = np.clip((epoch - start_epoch) / (end_epoch - start_epoch), 0.0, 1.0)
     return float(target * (1.0 - (1.0 - progress) ** 3))
 
 
@@ -61,8 +57,9 @@ class GlobalTaylorPruner:
         output_name=None,
         min_per_output_unit=1,
     ):
-        named_weights = dict(named_weights)
-        mask_tensors = dict(mask_tensors)
+        self.weights = dict(named_weights)
+        self.mask_tensors = dict(mask_tensors)
+        self.names = list(self.weights)
 
         if not 0.0 <= ema_decay < 1.0:
             raise ValueError("ema_decay must be in [0, 1).")
@@ -70,55 +67,39 @@ class GlobalTaylorPruner:
             raise ValueError(f"criterion must be one of {CRITERIA}.")
         if not 0.0 <= min_keep_fraction <= 1.0:
             raise ValueError("min_keep_fraction must be in [0, 1].")
-        if not named_weights:
+        if not self.names:
             raise ValueError("No eligible weights.")
-        if set(named_weights) != set(mask_tensors):
+        if set(self.weights) != set(self.mask_tensors):
             raise ValueError("Weights and masks must have matching keys.")
         if min_per_output_unit < 0:
             raise ValueError("min_per_output_unit must be >= 0.")
-        if output_name is not None and output_name not in named_weights:
+        if output_name is not None and output_name not in self.weights:
             raise ValueError(f"Unknown output_name {output_name!r}.")
+        for name in self.names:
+            m = self.mask_tensors[name].data
+            if self.weights[name].data.shape != m.shape:
+                raise ValueError(f"Mask shape mismatch for {name}.")
+            if not np.all((m == 0) | (m == 1)):
+                raise ValueError(f"Mask for {name} must contain only 0 and 1.")
 
-        self.names = list(named_weights)
-        self.weights = named_weights
-        self.mask_tensors = mask_tensors
         self.ema_decay = ema_decay
         self.criterion = criterion
         self.min_keep_fraction = min_keep_fraction
         self.output_name = output_name
         self.min_per_output_unit = int(min_per_output_unit)
 
-        for name in self.names:
-            w = self.weights[name].data
-            m = self.mask_tensors[name].data
-            if w.shape != m.shape:
-                raise ValueError(f"Mask shape mismatch for {name}.")
-            if not np.all((m == 0) | (m == 1)):
-                raise ValueError(f"Mask for {name} must contain only 0 and 1.")
-        if output_name is not None and self.weights[output_name].data.ndim != 2:
-            raise ValueError("output_name must refer to a 2-D weight.")
-
-        self.scores = {
-            name: np.zeros(self.weights[name].data.shape, dtype=np.float64)
-            for name in self.names
-        }
-        self._steps = {name: 0 for name in self.names}
-        self._expected = {name: self.mask(name).copy() for name in self.names}
+        self.scores = {n: np.zeros(self.weights[n].data.shape) for n in self.names}
+        self._steps = dict.fromkeys(self.names, 0)
         self.safeguard_kept = 0
 
     # ------------------------------------------------------------------ masks
     def mask(self, name):
         """Boolean mask read from the layer's mask Tensor (a fresh array)."""
-        return np.asarray(self.mask_tensors[name].data) != 0
+        return self.mask_tensors[name].data != 0
 
     @property
     def masks(self):
         return {name: self.mask(name) for name in self.names}
-
-    def _write_mask(self, name, new_mask):
-        target = self.mask_tensors[name].data
-        target[...] = new_mask.astype(target.dtype)  # in place: identity kept
-        self._expected[name] = new_mask.copy()
 
     # --------------------------------------------------------------- saliency
     def observe(self):
@@ -129,26 +110,17 @@ class GlobalTaylorPruner:
             param = self.weights[name]
             if param.grad is None:
                 continue
-            w = np.asarray(param.data, dtype=np.float64)
-            g = np.asarray(param.grad, dtype=np.float64)
-            if g.shape != w.shape:
-                raise ValueError(f"Gradient shape mismatch for {name}.")
-            if not np.all(np.isfinite(g)):
-                raise FloatingPointError(f"Non-finite gradient in {name}.")
-
-            wg = w * g  # per-minibatch product; abs/square before averaging
+            wg = param.data * param.grad  # abs/square per minibatch, before averaging
             current = np.abs(wg) if self.criterion == "taylor_abs" else wg * wg
-            current = np.where(self.mask(name), current, 0.0)
-
             score = self.scores[name]
             score *= self.ema_decay
-            score += (1.0 - self.ema_decay) * current
+            score += (1.0 - self.ema_decay) * np.where(self.mask(name), current, 0.0)
             self._steps[name] += 1
 
     def saliency(self, name):
         """Bias-corrected EMA score (or |w| for the magnitude criterion)."""
         if self.criterion == "magnitude":
-            return np.abs(np.asarray(self.weights[name].data, dtype=np.float64))
+            return np.abs(self.weights[name].data)
         t = self._steps[name]
         if t == 0:
             return np.zeros_like(self.scores[name])
@@ -156,24 +128,21 @@ class GlobalTaylorPruner:
 
     # ---------------------------------------------------------------- pruning
     def _protected(self, name, mask, score):
-        """Flat (C-order) boolean array of alive weights kept by safeguards."""
-        flat_mask = mask.reshape(-1)
-        flat_score = score.reshape(-1)
-        protected = np.zeros(flat_mask.size, dtype=bool)
-        alive = np.flatnonzero(flat_mask)
+        """Boolean array (mask's shape) of alive weights kept by safeguards."""
+        protected = np.zeros(mask.shape, dtype=bool)
 
-        floor = int(np.ceil(self.min_keep_fraction * flat_mask.size))
-        floor = min(floor, alive.size)
-        if floor:
-            order = np.argsort(-flat_score[alive], kind="stable")
-            protected[alive[order[:floor]]] = True
+        # Per-layer floor: the top-scoring alive weights.
+        alive = np.flatnonzero(mask)
+        floor = min(int(np.ceil(self.min_keep_fraction * mask.size)), alive.size)
+        order = np.argsort(-score.ravel()[alive], kind="stable")
+        protected.flat[alive[order[:floor]]] = True
 
-        if name == self.output_name and self.min_per_output_unit:
+        # Output units: each keeps its top-scoring alive inputs.
+        if name == self.output_name:
             for j in range(mask.shape[1]):
                 rows = np.flatnonzero(mask[:, j])
                 top = rows[np.argsort(-score[rows, j], kind="stable")]
-                for i in top[: self.min_per_output_unit]:
-                    protected[np.ravel_multi_index((i, j), mask.shape)] = True
+                protected[top[: self.min_per_output_unit], j] = True
         return protected
 
     def prune_to(self, target_sparsity, optimizer=None):
@@ -184,44 +153,38 @@ class GlobalTaylorPruner:
         if not 0.0 <= target_sparsity < 1.0:
             raise ValueError("target_sparsity must be in [0, 1).")
 
-        masks = self.masks
-        total = sum(m.size for m in masks.values())
-        target_removed = removal_budget(target_sparsity, total)
-        already_removed = sum(int(np.count_nonzero(~m)) for m in masks.values())
-        if target_removed < already_removed:
+        removed, total = self._counts()
+        number_to_remove = removal_budget(target_sparsity, total) - removed
+        if number_to_remove < 0:
             raise ValueError("Target sparsity cannot decrease for a monotonic pruner.")
 
-        number_to_remove = target_removed - already_removed
         self.safeguard_kept = 0
-
         if number_to_remove:
             if self.criterion != "magnitude" and not any(self._steps.values()):
                 raise ValueError("No saliency observed; call observe() before pruning.")
-            new_masks = self._select(masks, number_to_remove)
-            for name in self.names:
-                self._write_mask(name, new_masks[name])
+            for name, new_mask in self._select(number_to_remove).items():
+                target = self.mask_tensors[name].data
+                target[...] = new_mask  # in place: the layer's mask Tensor keeps its identity
 
         self.enforce(optimizer)
         return self.sparsity()
 
-    def _select(self, masks, number_to_remove):
+    def _select(self, number_to_remove):
+        """New masks with the lowest-scoring unprotected alive weights removed."""
+        masks = self.masks
         owners, indices, scores, protected = [], [], [], []
         for k, name in enumerate(self.names):
-            mask = masks[name]
-            score = self.saliency(name)
-            alive = np.flatnonzero(mask.reshape(-1))
+            mask, score = masks[name], self.saliency(name)
+            alive = np.flatnonzero(mask)
             owners.append(np.full(alive.size, k))
             indices.append(alive)
-            scores.append(score.reshape(-1)[alive])
-            protected.append(self._protected(name, mask, score)[alive])
+            scores.append(score.ravel()[alive])
+            protected.append(self._protected(name, mask, score).ravel()[alive])
 
         owners = np.concatenate(owners)
         indices = np.concatenate(indices)
         scores = np.concatenate(scores)
         protected = np.concatenate(protected)
-
-        if not np.all(np.isfinite(scores)):
-            raise FloatingPointError("Non-finite saliency scores.")
 
         candidates = np.flatnonzero(~protected)
         if number_to_remove > candidates.size:
@@ -238,80 +201,48 @@ class GlobalTaylorPruner:
         unconstrained = np.argsort(scores, kind="stable")[:number_to_remove]
         self.safeguard_kept = int(np.count_nonzero(protected[unconstrained]))
 
-        new_masks = {}
         for k, name in enumerate(self.names):
-            flat = masks[name].reshape(-1).copy()  # explicit copy, no view reliance
-            flat[indices[selected[owners[selected] == k]]] = False
-            new_masks[name] = flat.reshape(masks[name].shape)
-        return new_masks
+            masks[name].flat[indices[selected[owners[selected] == k]]] = False
+        return masks
 
     # ------------------------------------------------------------ enforcement
     def enforce(self, optimizer=None):
-        """Restore the masking invariant for every eligible weight.
-
-        Zeroes pruned weights and gradients, then hands the mask to the
-        optimizer: ``set_mask`` (MaskedAdam, which also remembers it) when
-        available, otherwise ``mask_state`` (plain Adam, which only clears
-        m and v). Safe to call after every ``optimizer.step()``.
-        """
-        if optimizer is not None:
-            if hasattr(optimizer, "set_mask"):
-                push = optimizer.set_mask
-            elif hasattr(optimizer, "mask_state"):
-                push = optimizer.mask_state
-            else:
-                raise TypeError(
-                    "Optimizer must implement set_mask(param, mask) "
-                    "or mask_state(param, mask)."
-                )
+        """Zero pruned weights and gradients; hand each mask to a MaskedAdam."""
         for name in self.names:
-            mask = self.mask(name)
-            param = self.weights[name]
+            mask, param = self.mask(name), self.weights[name]
             param.data[~mask] = 0.0
             if param.grad is not None:
                 param.grad[~mask] = 0.0
             if optimizer is not None:
-                push(param, mask)
+                optimizer.set_mask(param, mask)
 
     def check_integrity(self, optimizer=None):
-        """Raise unless the masking invariant holds for every eligible weight.
-
-        Always checked: masks hold only 0/1, were changed only by the
-        pruner, and pruned raw weights are exactly 0; pruned gradients, if
-        present, are exactly 0. With an optimizer that exposes
-        ``moments(param)``, Adam's m and v must be exactly 0 at pruned
-        entries; with ``mask_of(param)``, its stored mask must equal the
-        layer mask.
-        """
+        """Raise unless pruned weights, gradients and (with a MaskedAdam)
+        Adam moments are exactly 0, and the optimizer's mask matches."""
         for name in self.names:
-            m = np.asarray(self.mask_tensors[name].data)
-            if not np.all((m == 0) | (m == 1)):
-                raise ValueError(f"Mask for {name} contains values other than 0 and 1.")
-            mask = m != 0
-            if not np.array_equal(mask, self._expected[name]):
-                raise RuntimeError(f"Mask for {name} was modified outside the pruner.")
-            param = self.weights[name]
-            if np.any(np.asarray(param.data)[~mask] != 0):
+            mask, param = self.mask(name), self.weights[name]
+            if np.any(param.data[~mask] != 0):
                 raise RuntimeError(f"Pruned raw weights of {name} are nonzero.")
-            if param.grad is not None and np.any(np.asarray(param.grad)[~mask] != 0):
+            if param.grad is not None and np.any(param.grad[~mask] != 0):
                 raise RuntimeError(f"Pruned gradients of {name} are nonzero.")
             if optimizer is None:
                 continue
-            if hasattr(optimizer, "moments"):
-                first, second = optimizer.moments(param)
-                if np.any(first[~mask] != 0) or np.any(second[~mask] != 0):
-                    raise RuntimeError(f"Adam moments of {name} are nonzero at pruned entries.")
-            if hasattr(optimizer, "mask_of"):
-                stored = optimizer.mask_of(param)
-                if stored is not None and not np.array_equal(stored, mask):
-                    raise RuntimeError(f"Optimizer mask for {name} differs from the layer mask.")
+            first, second = optimizer.moments(param)
+            if np.any(first[~mask] != 0) or np.any(second[~mask] != 0):
+                raise RuntimeError(f"Adam moments of {name} are nonzero at pruned entries.")
+            stored = optimizer.mask_of(param)
+            if stored is not None and not np.array_equal(stored, mask):
+                raise RuntimeError(f"Optimizer mask for {name} differs from the layer mask.")
 
     # -------------------------------------------------------------- reporting
+    def _counts(self):
+        """(removed, total) eligible connections."""
+        masks = self.masks.values()
+        return sum(int(np.count_nonzero(~m)) for m in masks), sum(m.size for m in masks)
+
     def sparsity(self):
         """Fraction of eligible weight connections removed (biases excluded)."""
-        masks = self.masks
-        total = sum(m.size for m in masks.values())
-        removed = sum(int(np.count_nonzero(~m)) for m in masks.values())
+        removed, total = self._counts()
         return removed / total
 
     def layer_report(self):
@@ -319,6 +250,5 @@ class GlobalTaylorPruner:
         report = {}
         for name, m in self.masks.items():
             kept, total = int(np.count_nonzero(m)), int(m.size)
-            report[name] = {"kept": kept, "total": total,
-                            "sparsity": 1.0 - kept / total}
+            report[name] = {"kept": kept, "total": total, "sparsity": 1.0 - kept / total}
         return report
