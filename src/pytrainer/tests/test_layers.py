@@ -117,3 +117,94 @@ def test_mlp_param_count():
     model = MLP(np.random.default_rng(SEED))
     total = sum(p.data.size for p in model.parameters())
     assert total == (2 * 32 + 32) + (32 * 16 + 16) + (16 * 2 + 2)
+
+
+# ----------------------------------------------------------------------
+# Forward-graph weight mask: W_effective = W * M
+# ----------------------------------------------------------------------
+def masked_layer(seed=SEED):
+    rng = np.random.default_rng(seed)
+    lin = Linear(3, 4, rng)
+    mask = rng.random((3, 4)) > 0.5
+    lin.set_weight_mask(mask)
+    return lin, mask, rng
+
+
+def test_mask_starts_dense_and_is_not_trainable():
+    lin = Linear(3, 4, np.random.default_rng(SEED))
+    np.testing.assert_array_equal(lin.weight_mask.data, 1.0)
+    assert lin.weight_mask.requires_grad is False
+    assert all(p is not lin.weight_mask for p in lin.parameters())
+    assert lin.active_weights == 12
+
+
+def test_forward_uses_effective_weight():
+    lin, mask, rng = masked_layer()
+    x = rng.standard_normal((5, 3))
+    expected = x @ (lin.weight.data * mask) + lin.bias.data
+    np.testing.assert_allclose(lin(x).data, expected)
+
+
+def test_masked_connection_has_no_effect_whatever_its_raw_value():
+    lin, mask, rng = masked_layer()
+    x = rng.standard_normal((5, 3))
+    before = lin(x).data.copy()
+    lin.weight.data[~mask] = 1e6  # corrupt every pruned raw weight
+    np.testing.assert_array_equal(lin(x).data, before)
+
+
+def test_gradient_is_mask_times_effective_gradient():
+    lin, mask, rng = masked_layer()
+    x = rng.standard_normal((5, 3))
+    g = rng.standard_normal((5, 4))
+    ops.sum(ops.mul(lin(x), Tensor(g))).backward()
+    # dL/dW_eff = x^T g ; dL/dW = M * dL/dW_eff
+    np.testing.assert_allclose(lin.weight.grad, mask * (x.T @ g))
+    assert np.all(lin.weight.grad[~mask] == 0.0)
+    assert lin.weight_mask.grad is None  # constant: no gradient stored
+
+
+def test_masked_gradients_match_finite_differences():
+    lin, mask, rng = masked_layer()
+    x = rng.standard_normal((4, 3))
+    g = rng.standard_normal((4, 4))
+    lin.weight.grad = None
+    ops.sum(ops.mul(lin(x), Tensor(g))).backward()
+    f = lambda: float(np.sum(lin(x).data * g))
+    eps = 1e-6
+    for i in np.ndindex(lin.weight.shape):
+        old = lin.weight.data[i]
+        lin.weight.data[i] = old + eps; fp = f()
+        lin.weight.data[i] = old - eps; fm = f()
+        lin.weight.data[i] = old
+        np.testing.assert_allclose(lin.weight.grad[i], (fp - fm) / (2 * eps), atol=1e-8)
+
+
+def test_set_weight_mask_is_in_place_and_validated():
+    lin = Linear(3, 4, np.random.default_rng(SEED))
+    mask_tensor, mask_array = lin.weight_mask, lin.weight_mask.data
+    lin.set_weight_mask(np.zeros((3, 4), dtype=bool))
+    assert lin.weight_mask is mask_tensor and lin.weight_mask.data is mask_array
+    assert lin.active_weights == 0
+    with pytest.raises(ValueError):
+        lin.set_weight_mask(np.ones((4, 3)))
+    with pytest.raises(ValueError):
+        lin.set_weight_mask(np.full((3, 4), 0.5))
+
+
+def test_dense_mask_leaves_outputs_and_gradients_bit_identical():
+    rng = np.random.default_rng(SEED)
+    lin = Linear(3, 4, rng)
+    x = rng.standard_normal((5, 3))
+    out = lin(x)
+    np.testing.assert_array_equal(out.data, x @ lin.weight.data + lin.bias.data)
+    g = rng.standard_normal((5, 4))
+    ops.sum(ops.mul(out, Tensor(g))).backward()
+    np.testing.assert_array_equal(lin.weight.grad, x.T @ g)
+
+
+def test_mlp_parameters_exclude_masks():
+    model = MLP(np.random.default_rng(SEED))
+    masks = {id(l.weight_mask) for l in (model.fc1, model.fc2, model.fc3)}
+    assert not any(id(p) in masks for p in model.parameters())
+    assert len(model.parameters()) == 6

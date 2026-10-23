@@ -13,9 +13,6 @@ class Tensor:
         self._parents = tuple(_parents)
         self._backward = _backward
 
-    # ------------------------------------------------------------------
-    # Shape / dimension / representation helpers
-    # ------------------------------------------------------------------
     @property
     def shape(self):
         return self.data.shape
@@ -27,17 +24,6 @@ class Tensor:
     @property
     def size(self):
         return self.data.size
-
-    @property
-    def dtype(self):
-        return self.data.dtype
-
-    @property
-    def T(self):
-        return Tensor(self.data.T, requires_grad=self.requires_grad)
-
-    def __len__(self):
-        return len(self.data)
 
     def item(self):
         return self.data.item()
@@ -52,67 +38,32 @@ class Tensor:
             self.grad = np.zeros_like(self.data)
         return self.grad
 
-    def _graph_metadata(self):
-        """Inspectable graph metadata for this node."""
-        return {
-            "id": id(self),
-            "shape": self.shape,
-            "requires_grad": self.requires_grad,
-            "grad": self.grad,
-            "parents": [id(p) for p in self._parents],
-            "has_backward": self._backward is not None,
-        }
-
-    # ------------------------------------------------------------------
-    # Backward pass: reverse topological traversal of the graph
-    # ------------------------------------------------------------------
     def backward(self, seed=None):
         if not self.requires_grad:
             raise RuntimeError("called backward on a tensor that does not require grad")
-        
-        # initialize the output gradient
+
         if seed is None:
-            if self.data.ndim != 0:
-                raise ValueError(
-                    "seed must be provided for non-scalar outputs"
-                )
+            if self.ndim != 0:
+                raise ValueError("seed must be provided for non-scalar outputs")
             seed = np.ones_like(self.data)
         else:
             seed = np.asarray(seed, dtype=np.float64)
-            if seed.shape != self.data.shape:
-                raise ValueError(
-                    f"Expected seed shape {self.data.shape}, "
-                    f"got {seed.shape}"
-                )
-            
+            if seed.shape != self.shape:
+                raise ValueError(f"Expected seed shape {self.shape}, got {seed.shape}")
+
         self._ensure_grad()
         self.grad += seed
 
-        topo, state, stack = [], {}, [(self, False)]
+        # Iterative post-order DFS: every node lands in `topo` after its parents.
+        topo, visited, stack = [], set(), [(self, False)]
         while stack:
             node, expanded = stack.pop()
-            node_id = id(node)
-
             if expanded:
-                if state.get(node_id) == 2:
-                    continue
-
-                state[node_id] = 2
                 topo.append(node)
-                continue
-
-            if state.get(node_id) == 2:
-                continue
-
-            if state.get(node_id) == 1:
-                continue
-
-            state[node_id] = 1
-            stack.append((node, True))
-
-            for parent in reversed(node._parents):
-                if state.get(id(parent)) != 2:
-                    stack.append((parent, False))
+            elif id(node) not in visited:
+                visited.add(id(node))
+                stack.append((node, True))
+                stack.extend((parent, False) for parent in reversed(node._parents))
 
         for node in reversed(topo):
             if node._backward is not None:
